@@ -4,18 +4,39 @@ import os
 import time
 import traceback
 import argparse
+import tempfile
+import yaml
 
 _parser = argparse.ArgumentParser(description="Run HuggingGPT on a JSONL benchmark file")
 _parser.add_argument("input", nargs="?", default="BLINK_100sample.jsonl", help="Input JSONL file")
 _parser.add_argument("output", nargs="?", default="result.json", help="Output JSON file")
-_parser.add_argument("--config", type=str, default="configs/config.default.yaml",
-                     help="Path to HuggingGPT config YAML (use configs/config.multiround.yaml for multi-round)")
+_parser.add_argument("--config", type=str, action="append", default=None,
+                     help="Config YAML file(s). Can be specified multiple times; later files override earlier ones. "
+                          "E.g.: --config configs/config.default.yaml --config configs/bbox_xyxy.yaml")
 _cli_args = _parser.parse_args()
 
 input_file = _cli_args.input
 output_file = _cli_args.output
 
-os.environ["AWESOME_CHAT_CONFIG"] = _cli_args.config
+config_files = _cli_args.config or ["configs/config.default.yaml"]
+
+if len(config_files) == 1:
+    os.environ["AWESOME_CHAT_CONFIG"] = config_files[0]
+else:
+    merged = {}
+    for cfg_path in config_files:
+        with open(cfg_path, "r") as f:
+            layer = yaml.load(f, Loader=yaml.FullLoader) or {}
+        for k, v in layer.items():
+            if isinstance(v, dict) and isinstance(merged.get(k), dict):
+                merged[k].update(v)
+            else:
+                merged[k] = v
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False, dir="configs")
+    yaml.dump(merged, tmp, default_flow_style=False)
+    tmp.close()
+    os.environ["AWESOME_CHAT_CONFIG"] = tmp.name
+
 sys.argv = [sys.argv[0], "--mode", "cli"]
 
 from awesome_chat import chat_huggingface, API_KEY, API_TYPE, API_ENDPOINT

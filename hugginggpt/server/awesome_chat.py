@@ -13,7 +13,7 @@ import json
 import logging
 import argparse
 import yaml
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 from diffusers.utils import load_image
 from pydub import AudioSegment
 import threading
@@ -31,9 +31,11 @@ parser.add_argument("--config", type=str, default="configs/config.default.yaml")
 parser.add_argument("--mode", type=str, default="cli")
 args = parser.parse_args()
 
-if __name__ != "__main__":
+if __name__ != "__main__" and "AWESOME_CHAT_CONFIG" not in os.environ:
     args.config = "configs/config.gradio.yaml"
     args.mode = "gradio"
+elif "AWESOME_CHAT_CONFIG" in os.environ:
+    args.config = os.environ["AWESOME_CHAT_CONFIG"]
 
 config = yaml.load(open(args.config, "r"), Loader=yaml.FullLoader)
 
@@ -101,7 +103,8 @@ elif API_TYPE == "azure":
     API_ENDPOINT = f"{config['azure']['base_url']}/openai/deployments/{config['azure']['deployment_name']}/{api_name}?api-version={config['azure']['api_version']}"
     API_KEY = config["azure"]["api_key"]
 elif API_TYPE == "openai":
-    API_ENDPOINT = f"https://api.openai.com/v1/{api_name}"
+    openai_base = config["openai"].get("base_url", "https://api.openai.com")
+    API_ENDPOINT = f"{openai_base}/v1/{api_name}"
     if config["openai"]["api_key"].startswith("sk-"):  # Check for valid OpenAI key in config file
         API_KEY = config["openai"]["api_key"]
     elif "OPENAI_API_KEY" in os.environ and os.getenv("OPENAI_API_KEY").startswith("sk-"):  # Check for environment variable OPENAI_API_KEY
@@ -163,7 +166,9 @@ elif "HUGGINGFACE_ACCESS_TOKEN" in os.environ and os.getenv("HUGGINGFACE_ACCESS_
         "Authorization": f"Bearer {os.getenv('HUGGINGFACE_ACCESS_TOKEN')}",
     }
 else:
-    raise ValueError(f"Incorrect HuggingFace token. Please check your {args.config} file.")
+    if config.get("inference_mode") != "local":
+        raise ValueError(f"Incorrect HuggingFace token. Please check your {args.config} file.")
+    logger.warning("No HuggingFace token provided. Only local models will be available.")
 
 def convert_chat_to_completion(data):
     messages = data.pop('messages', [])
@@ -203,14 +208,75 @@ def send_request(data):
         }
     else:
         HEADER = None
-    response = requests.post(api_endpoint, json=data, headers=HEADER, proxies=PROXY)
-    if "error" in response.json():
-        return response.json()
-    logger.debug(response.text.strip())
-    if use_completion:
-        return response.json()["choices"][0]["text"].strip()
-    else:
-        return response.json()["choices"][0]["message"]["content"].strip()
+
+    # Retry with exponential backoff for transient upstream errors (500s,
+    # "do_request_failed", network timeouts). Each LLM call retries locally so
+    # one flaky request doesn't force the whole pipeline to restart.
+    max_attempts = 6
+    backoff = [1, 2, 5, 10, 20, 40]
+    last_err = None
+    for attempt in range(max_attempts):
+        try:
+            response = requests.post(api_endpoint, json=data, headers=HEADER, proxies=PROXY, timeout=120)
+            try:
+                parsed = response.json()
+            except Exception:
+                parsed = None
+
+            # HTTP-level failure (e.g. 500 from upstream proxy)
+            if response.status_code >= 500 or (isinstance(parsed, dict) and "error" in parsed and _is_transient_error(parsed)):
+                err_msg = parsed if parsed is not None else response.text[:300]
+                last_err = err_msg
+                if attempt < max_attempts - 1:
+                    wait = backoff[attempt]
+                    logger.warning(f"[send_request] transient upstream error (attempt {attempt + 1}/{max_attempts}), retrying in {wait}s: {str(err_msg)[:200]}")
+                    time.sleep(wait)
+                    continue
+                # Out of retries: return the error dict so callers can handle gracefully
+                if isinstance(parsed, dict):
+                    return parsed
+                return {"error": {"message": f"HTTP {response.status_code}: {response.text[:300]}"}}
+
+            # Non-transient error in body (e.g. auth, bad request) -> return as-is, no retry
+            if isinstance(parsed, dict) and "error" in parsed:
+                return parsed
+
+            logger.debug(response.text.strip())
+            if use_completion:
+                return parsed["choices"][0]["text"].strip()
+            else:
+                content = parsed["choices"][0]["message"]["content"]
+                if isinstance(content, list):
+                    content = " ".join(item.get("text", str(item)) for item in content if isinstance(item, dict))
+                elif not isinstance(content, str):
+                    content = str(content)
+                return content.strip()
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            last_err = str(e)
+            if attempt < max_attempts - 1:
+                wait = backoff[attempt]
+                logger.warning(f"[send_request] network error (attempt {attempt + 1}/{max_attempts}), retrying in {wait}s: {e}")
+                time.sleep(wait)
+                continue
+            return {"error": {"message": f"network error after {max_attempts} attempts: {e}"}}
+
+    return {"error": {"message": f"request failed after {max_attempts} attempts: {last_err}"}}
+
+
+def _is_transient_error(parsed):
+    """Return True if the error dict represents a transient upstream issue worth retrying."""
+    err = parsed.get("error", {}) if isinstance(parsed, dict) else {}
+    if not isinstance(err, dict):
+        return False
+    code = str(err.get("code", "")).lower()
+    msg = str(err.get("message", "")).lower()
+    transient_codes = {"do_request_failed", "rate_limit_exceeded", "server_error", "timeout", "service_unavailable"}
+    transient_markers = ["upstream error", "do request failed", "rate limit", "timeout", "overloaded", "try again", "temporarily"]
+    if code in transient_codes:
+        return True
+    if any(m in msg for m in transient_markers):
+        return True
+    return False
 
 def replace_slot(text, entries):
     for key, value in entries.items():
@@ -340,7 +406,6 @@ def parse_task(context, input, api_key, api_type, api_endpoint):
         "model": LLM,
         "messages": messages,
         "temperature": 0,
-        "logit_bias": {item: config["logit_bias"]["parse_task"] for item in task_parsing_highlight_ids},
         "api_key": api_key,
         "api_type": api_type,
         "api_endpoint": api_endpoint
@@ -366,7 +431,6 @@ def choose_model(input, task, metas, api_key, api_type, api_endpoint):
         "model": LLM,
         "messages": messages,
         "temperature": 0,
-        "logit_bias": {item: config["logit_bias"]["choose_model"] for item in choose_model_highlight_ids}, # 5
         "api_key": api_key,
         "api_type": api_type,
         "api_endpoint": api_endpoint
@@ -888,6 +952,192 @@ def run_task(input, command, results, api_key, api_type, api_endpoint):
     results[id] = collect_result(command, choose, inference_result)
     return True
 
+def _draw_bbox_separate_image(predicted, original_image_path):
+    """Draw red bounding boxes with labels on a black image matching the original image size.
+
+    Returns the saved image path (relative, e.g. /images/xxxx_bbox.jpg) or None on failure.
+    """
+    try:
+        if original_image_path.startswith("public/"):
+            full_path = original_image_path
+        elif original_image_path.startswith("/"):
+            full_path = f"public{original_image_path}"
+        elif original_image_path.startswith("http"):
+            full_path = None
+        else:
+            full_path = f"public/{original_image_path}"
+
+        if full_path and os.path.exists(full_path):
+            orig = Image.open(full_path)
+            width, height = orig.size
+        elif original_image_path.startswith("http"):
+            orig = load_image(original_image_path)
+            width, height = orig.size
+        else:
+            width, height = 640, 480
+            logger.warning(f"Cannot determine original image size from {original_image_path}, using {width}x{height}")
+
+        black_img = Image.new("RGB", (width, height), (0, 0, 0))
+        draw = ImageDraw.Draw(black_img)
+
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 16)
+        except (IOError, OSError):
+            font = ImageFont.load_default()
+
+        for item in predicted:
+            if "box" not in item:
+                continue
+            box = item["box"]
+            label = item.get("label", "object")
+            if all(k in box for k in ("xmin", "ymin", "xmax", "ymax")):
+                x0, y0, x1, y1 = box["xmin"], box["ymin"], box["xmax"], box["ymax"]
+            elif all(k in box for k in ("x", "y", "w", "h")):
+                x0, y0 = box["x"], box["y"]
+                x1, y1 = x0 + box["w"], y0 + box["h"]
+            else:
+                continue
+
+            draw.rectangle([(x0, y0), (x1, y1)], outline=(255, 0, 0), width=3)
+
+            text_bbox = draw.textbbox((0, 0), label, font=font)
+            tw = text_bbox[2] - text_bbox[0]
+            th = text_bbox[3] - text_bbox[1]
+            text_x = x0
+            text_y = y0 - th - 4 if y0 - th - 4 >= 0 else y0
+            draw.rectangle([(text_x, text_y), (text_x + tw + 4, text_y + th + 2)], fill=(255, 0, 0))
+            draw.text((text_x + 2, text_y), label, fill=(255, 255, 255), font=font)
+
+        name = str(uuid.uuid4())[:4]
+        save_path = f"public/images/{name}_bbox.jpg"
+        os.makedirs("public/images", exist_ok=True)
+        black_img.save(save_path)
+        return f"/images/{name}_bbox.jpg"
+    except Exception as e:
+        logger.warning(f"Failed to draw bbox separate image: {e}")
+        return None
+
+
+def _convert_predicted_to_xywh(predicted):
+    """Convert predicted bounding boxes from xyxy (xmin,ymin,xmax,ymax) to xywh (x,y,width,height)."""
+    converted = []
+    for item in predicted:
+        item = copy.deepcopy(item)
+        if "box" in item and all(k in item["box"] for k in ("xmin", "ymin", "xmax", "ymax")):
+            box = item["box"]
+            item["box"] = {
+                "x": box["xmin"],
+                "y": box["ymin"],
+                "w": box["xmax"] - box["xmin"],
+                "h": box["ymax"] - box["ymin"],
+            }
+        converted.append(item)
+    return converted
+
+
+def summarize_round_results(results):
+    """Produce a concise text summary of inference results from one round."""
+    summaries = []
+    for task_id, result in sorted(results.items(), key=lambda x: x[0]):
+        task_info = result.get("task", {})
+        task_type = task_info.get("task", "unknown")
+        inference = result.get("inference result", {})
+        model_info = result.get("choose model result", {})
+        model_id = model_info.get("id", "unknown") if isinstance(model_info, dict) else "unknown"
+
+        if isinstance(inference, dict) and "error" in inference:
+            summary = f"Task {task_id} ({task_type}): FAILED - {inference['error']}"
+        elif isinstance(inference, dict):
+            outputs = []
+            for key in ["generated image", "generated audio", "generated text", "generated video", "response", "answer"]:
+                if key in inference:
+                    outputs.append(f"{key}: {inference[key]}")
+            if (config.get("bbox_xyxy", False) or config.get("bbox_xywh", False)) and "predicted" in inference:
+                predicted = inference["predicted"]
+                if config.get("bbox_xywh", False) and isinstance(predicted, list):
+                    predicted = _convert_predicted_to_xywh(predicted)
+                pred_str = json.dumps(predicted)
+                if len(pred_str) > 500:
+                    pred_str = pred_str[:500] + "..."
+                outputs.append(f"predicted: {pred_str}")
+            if "bbox_separate_image" in inference:
+                outputs.append(f"bbox visualization (black background): {inference['bbox_separate_image']}")
+            if not outputs:
+                outputs.append(str(inference)[:200])
+            summary = f"Task {task_id} ({task_type}, model: {model_id}): {'; '.join(outputs)}"
+        elif isinstance(inference, list):
+            top_results = inference[:3]
+            summary = f"Task {task_id} ({task_type}, model: {model_id}): {json.dumps(top_results)}"
+        else:
+            summary = f"Task {task_id} ({task_type}): {str(inference)[:200]}"
+
+        summaries.append(summary)
+    return "\n".join(summaries)
+
+
+def collect_artifact_paths(results):
+    """Gather paths of generated images, audio, text, video from all results."""
+    artifacts = {}
+    for task_id, result in sorted(results.items(), key=lambda x: x[0]):
+        inference = result.get("inference result", {})
+        if not isinstance(inference, dict):
+            continue
+        for key in ["generated image", "generated audio", "generated text", "generated video", "bbox_separate_image"]:
+            if key in inference:
+                label = f"task_{task_id}_{key.replace(' ', '_')}"
+                artifacts[label] = inference[key]
+    return artifacts
+
+
+def build_reflection_prompt(response, result_summary, artifacts, round_num, max_rounds):
+    """Build the reflection prompt for the next round."""
+    parts = [
+        f"Your previous answer (round {round_num + 1}/{max_rounds}):",
+        response,
+        "",
+        "Summary of inference results:",
+        result_summary,
+    ]
+
+    if artifacts:
+        parts.append("")
+        parts.append("Generated artifacts available for use:")
+        for label, path in artifacts.items():
+            parts.append(f"  - {label}: {path}")
+
+    parts.extend([
+        "",
+        f"You are now in round {round_num + 2}/{max_rounds}. "
+        "Review your previous answer and the inference results above. "
+        "If you are confident the answer is correct, output an empty task list: []. "
+        "Otherwise, plan new or refined tasks to improve the answer. "
+        "Focus on what was wrong or incomplete. "
+        "Output ONLY the JSON task list.",
+    ])
+
+    return "\n".join(parts)
+
+
+def offset_tasks(tasks, offset):
+    """Shift task IDs and dependency references by offset to avoid collisions across rounds."""
+    new_tasks = copy.deepcopy(tasks)
+    for task in new_tasks:
+        task["id"] = task["id"] + offset
+        task["dep"] = [
+            (d + offset if d > 0 else d)
+            for d in task["dep"]
+        ]
+        if "args" in task:
+            for arg_key, arg_val in task["args"].items():
+                if isinstance(arg_val, str) and arg_val.startswith("<GENERATED>-"):
+                    try:
+                        dep_id = int(arg_val.split("-")[1])
+                        task["args"][arg_key] = f"<GENERATED>-{dep_id + offset}"
+                    except (IndexError, ValueError):
+                        pass
+    return new_tasks
+
+
 def chat_huggingface(messages, api_key, api_type, api_endpoint, return_planning = False, return_results = False):
     start = time.time()
     context = messages[:-1]
@@ -895,84 +1145,167 @@ def chat_huggingface(messages, api_key, api_type, api_endpoint, return_planning 
     logger.info("*"*80)
     logger.info(f"input: {input}")
 
-    task_str = parse_task(context, input, api_key, api_type, api_endpoint)
+    multi_round_enabled = config.get("multi_round", {}).get("enabled", False)
+    max_rounds = config.get("multi_round", {}).get("max_rounds", 3) if multi_round_enabled else 1
 
-    if "error" in task_str:
-        record_case(success=False, **{"input": input, "task": task_str, "reason": f"task parsing error: {task_str['error']['message']}", "op":"report message"})
-        return {"message": task_str["error"]["message"]}
+    all_round_results = {}
+    task_id_offset = 0
+    previous_response = None
+    previous_task_plans = []
 
-    task_str = task_str.strip()
-    logger.info(task_str)
+    for round_num in range(max_rounds):
+        if round_num == 0:
+            current_context = context
+            current_input = input
+        else:
+            current_context = context
+            current_input = input
 
-    try:
-        tasks = json.loads(task_str)
-    except Exception as e:
-        logger.debug(e)
-        response = chitchat(messages, api_key, api_type, api_endpoint)
-        record_case(success=False, **{"input": input, "task": task_str, "reason": "task parsing fail", "op":"chitchat"})
-        return {"message": response}
-    
-    if task_str == "[]":  # using LLM response for empty task
-        record_case(success=False, **{"input": input, "task": [], "reason": "task parsing fail: empty", "op": "chitchat"})
-        response = chitchat(messages, api_key, api_type, api_endpoint)
-        return {"message": response}
+        task_str = parse_task(current_context, current_input, api_key, api_type, api_endpoint)
 
-    if len(tasks) == 1 and tasks[0]["task"] in ["summarization", "translation", "conversational", "text-generation", "text2text-generation"]:
-        record_case(success=True, **{"input": input, "task": tasks, "reason": "chitchat tasks", "op": "chitchat"})
-        response = chitchat(messages, api_key, api_type, api_endpoint)
-        return {"message": response}
+        if "error" in task_str:
+            if round_num == 0:
+                record_case(success=False, **{"input": input, "task": task_str, "reason": f"task parsing error: {task_str['error']['message']}", "op":"report message"})
+                return {"message": task_str["error"]["message"]}
+            else:
+                logger.info(f"Round {round_num + 1}: task parsing error, accepting previous answer.")
+                break
 
-    tasks = unfold(tasks)
-    tasks = fix_dep(tasks)
-    logger.debug(tasks)
-    
-    if return_planning:
-        return tasks
+        task_str = task_str.strip()
+        logger.info(f"Round {round_num + 1} tasks: {task_str}")
 
-    results = {}
-    threads = []
-    tasks = tasks[:]
-    d = dict()
-    retry = 0
-    while True:
-        num_thread = len(threads)
-        for task in tasks:
-            # logger.debug(f"d.keys(): {d.keys()}, dep: {dep}")
-            for dep_id in task["dep"]:
-                if dep_id >= task["id"]:
-                    task["dep"] = [-1]
-                    break
-            dep = task["dep"]
-            if dep[0] == -1 or len(list(set(dep).intersection(d.keys()))) == len(dep):
-                tasks.remove(task)
-                thread = threading.Thread(target=run_task, args=(input, task, d, api_key, api_type, api_endpoint))
-                thread.start()
-                threads.append(thread)
-        if num_thread == len(threads):
-            time.sleep(0.5)
-            retry += 1
-        if retry > 160:
-            logger.debug("User has waited too long, Loop break.")
+        try:
+            tasks = json.loads(task_str)
+        except Exception as e:
+            logger.debug(e)
+            if round_num == 0:
+                response = chitchat(messages, api_key, api_type, api_endpoint)
+                record_case(success=False, **{"input": input, "task": task_str, "reason": "task parsing fail", "op":"chitchat"})
+                return {"message": response}
+            else:
+                logger.info(f"Round {round_num + 1}: task parsing fail, accepting previous answer.")
+                break
+
+        if task_str == "[]" or not tasks:
+            if round_num == 0:
+                record_case(success=False, **{"input": input, "task": [], "reason": "task parsing fail: empty", "op": "chitchat"})
+                response = chitchat(messages, api_key, api_type, api_endpoint)
+                return {"message": response}
+            else:
+                logger.info(f"Round {round_num + 1}: LLM returned empty tasks (confident). Stopping.")
+                break
+
+        if len(tasks) == 1 and tasks[0]["task"] in ["summarization", "translation", "conversational", "text-generation", "text2text-generation"]:
+            record_case(success=True, **{"input": input, "task": tasks, "reason": "chitchat tasks", "op": "chitchat"})
+            response = chitchat(messages, api_key, api_type, api_endpoint)
+            return {"message": response}
+
+        # Loop detection: stop if identical task plan is regenerated
+        task_plan_key = json.dumps(tasks, sort_keys=True)
+        if task_plan_key in previous_task_plans:
+            logger.info(f"Round {round_num + 1}: identical task plan detected, stopping.")
             break
-        if len(tasks) == 0:
-            break
-    for thread in threads:
-        thread.join()
-    
-    results = d.copy()
+        previous_task_plans.append(task_plan_key)
 
-    logger.debug(results)
+        tasks = unfold(tasks)
+        tasks = fix_dep(tasks)
+
+        if task_id_offset > 0:
+            tasks = offset_tasks(tasks, task_id_offset)
+
+        logger.debug(f"Round {round_num + 1} tasks (after offset): {tasks}")
+
+        if return_planning:
+            return tasks
+
+        # Execute tasks in parallel threads
+        d = dict()
+        threads = []
+        task_queue = tasks[:]
+        retry = 0
+        while True:
+            num_thread = len(threads)
+            for task in task_queue:
+                for dep_id in task["dep"]:
+                    if dep_id >= task["id"]:
+                        task["dep"] = [-1]
+                        break
+                dep = task["dep"]
+                if dep[0] == -1 or len(list(set(dep).intersection(d.keys()))) == len(dep):
+                    task_queue.remove(task)
+                    thread = threading.Thread(target=run_task, args=(input, task, d, api_key, api_type, api_endpoint))
+                    thread.start()
+                    threads.append(thread)
+            if num_thread == len(threads):
+                time.sleep(0.5)
+                retry += 1
+            if retry > 160:
+                logger.debug("User has waited too long, Loop break.")
+                break
+            if len(task_queue) == 0:
+                break
+        for thread in threads:
+            thread.join()
+
+        new_results = d.copy()
+
+        # bbox_separate: generate black-background bbox images for detection results
+        if config.get("bbox_separate", False):
+            for tid, res in new_results.items():
+                inference = res.get("inference result", {})
+                if isinstance(inference, dict) and "predicted" in inference and isinstance(inference["predicted"], list):
+                    task_info = res.get("task", {})
+                    original_image = task_info.get("args", {}).get("image", "")
+                    bbox_img_path = _draw_bbox_separate_image(inference["predicted"], original_image)
+                    if bbox_img_path:
+                        inference["bbox_separate_image"] = bbox_img_path
+                        logger.info(f"bbox_separate: generated {bbox_img_path} for task {tid}")
+
+        all_round_results.update(new_results)
+
+        # Update offset for next round
+        if new_results:
+            task_id_offset = max(all_round_results.keys()) + 1
+
+        logger.debug(f"Round {round_num + 1} results: {new_results}")
+
+        if return_results and round_num == max_rounds - 1:
+            return all_round_results
+
+        # Stage 4: generate response
+        response = response_results(input, all_round_results, api_key, api_type, api_endpoint)
+        if isinstance(response, dict):
+            record_case(success=False, **{"input": input, "task": task_str, "reason": f"response_results error: {response}", "op": "report message"})
+            return response
+        response = response.strip()
+        previous_response = response
+
+        # If this is the last round or single-round mode, return
+        if round_num == max_rounds - 1:
+            break
+
+        # Prepare reflection prompt for next round
+        result_summary = summarize_round_results(new_results)
+        artifact_info = collect_artifact_paths(all_round_results)
+        reflection = build_reflection_prompt(response, result_summary, artifact_info, round_num, max_rounds)
+
+        # Build messages for next round: original context + assistant response + reflection as user
+        context = messages[:-1] + [
+            {"role": "assistant", "content": response},
+            {"role": "user", "content": reflection},
+        ]
+        current_input = reflection
+        logger.info(f"Round {round_num + 1} complete, proceeding to round {round_num + 2}")
+
     if return_results:
-        return results
-    
-    response = response_results(input, results, api_key, api_type, api_endpoint).strip()
+        return all_round_results
 
     end = time.time()
     during = end - start
 
-    answer = {"message": response}
-    record_case(success=True, **{"input": input, "task": task_str, "results": results, "response": response, "during": during, "op":"response"})
-    logger.info(f"response: {response}")
+    answer = {"message": previous_response}
+    record_case(success=True, **{"input": input, "task": task_str, "results": all_round_results, "response": previous_response, "during": during, "op":"response"})
+    logger.info(f"response: {previous_response}")
     return answer
 
 def test():

@@ -153,7 +153,7 @@ def load_pipes(local_deployment):
                 "processor": SpeechT5Processor.from_pretrained(f"{local_fold}/microsoft/speecht5_vc"),
                 "model": SpeechT5ForSpeechToSpeech.from_pretrained(f"{local_fold}/microsoft/speecht5_vc"),
                 "vocoder": SpeechT5HifiGan.from_pretrained(f"{local_fold}/microsoft/speecht5_hifigan"),
-                "embeddings_dataset": load_dataset(f"{local_fold}/Matthijs/cmu-arctic-xvectors", split="validation"),
+                "embeddings_dataset": load_dataset("Matthijs/cmu-arctic-xvectors", split="validation", keep_in_memory=True, download_mode="force_redownload"),
                 "device": device
             },
             # "julien-c/wine-quality": {
@@ -485,6 +485,11 @@ def models(model_id):
         if model_id == "dandelin/vilt-b32-finetuned-vqa":
             question = request.get_json()["text"]
             img_url = request.get_json()["img_url"]
+            # ViLT has a hard limit of 40 text position embeddings; truncate if needed
+            tokens = pipe.tokenizer.encode(question, add_special_tokens=False)
+            if len(tokens) > 38:  # leave room for [CLS] and [SEP]
+                tokens = tokens[:38]
+                question = pipe.tokenizer.decode(tokens)
             result = pipe(question=question, image=img_url)
         
         #DQA

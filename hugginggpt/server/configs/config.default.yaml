@@ -1,5 +1,6 @@
 openai: 
-  api_key: REPLACE_WITH_YOUR_OPENAI_API_KEY_HERE
+  api_key: sk-cAqgkOUHZNSWe0Lmvdpzk5vS8b6TQjjHZqdrjclHpCFNcVpG
+  base_url: http://128.241.246.246:3000
 # azure:
 #   api_key: REPLACE_WITH_YOUR_AZURE_API_KEY_HERE
 #   base_url: REPLACE_WITH_YOUR_ENDPOINT_HERE
@@ -10,9 +11,9 @@ huggingface:
 dev: false
 debug: false
 log_file: logs/debug.log
-model: text-davinci-003 # currently only support text-davinci-003, gpt-4, we will support more open-source LLMs in the future
-use_completion: true
-inference_mode: hybrid # local, huggingface or hybrid, prefer hybrid
+model: Qwen2.5-VL-72B-Instruct # OpenAI-compatible model name served by your endpoint
+use_completion: false # false => /v1/chat/completions
+inference_mode: local # local, huggingface or hybrid, prefer hybrid
 local_deployment: full # minimal, standard or full, prefer full
 device: cuda:0 # cuda:id or cpu
 num_candidate_models: 5
@@ -24,6 +25,12 @@ http_listen:
 local_inference_endpoint:
   host: localhost
   port: 8005
+bbox_xyxy: false
+bbox_xywh: false
+bbox_separate: false
+multi_round:
+  enabled: false
+  max_rounds: 3
 logit_bias:
   parse_task: 0.1
   choose_model: 5
